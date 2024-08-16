@@ -752,38 +752,75 @@ def readZJUMoCapRefineInfo(path, white_background, output_path, eval):
     
         # Extract the indices from the face dictionary face
         f_indices = np.array(list(face.values()))
-        h_indices = np.array(list(face.values()))
-        
+        h_indices = np.array(list(hand.values()))
+
         # Use the indices to directly get the corresponding rows from big_pose_xyz face
         xyz_face = train_cam_infos[0].big_pose_world_vertex[f_indices]
-        xyz_hand = train_cam_infos[0].big_pose_world_vertex[h_indices]
+        xyz_l_hand = train_cam_infos[0].big_pose_world_vertex[h_indices[0:5]]
+        xyz_r_hand = train_cam_infos[0].big_pose_world_vertex[h_indices[5:10]]
         
         ###############################**********************########################################## change 2 
         
-        # obtain the original bounds for dense point sampling on the face
+        # obtain the original bounds for dense point sampling on the face + 0.1
         xyz_face_min_xyz = np.min(xyz_face, axis=0)
         xyz_face_max_xyz = np.max(xyz_face, axis=0)
-        xyz_face_min_xyz -= 0.05
-        xyz_face_max_xyz += 0.05
+        xyz_face_min_xyz -= 0.1
+        xyz_face_max_xyz += 0.1
         # xyz_face_world_bound = np.stack([xyz_face_min_xyz, xyz_face_max_xyz], axis=0)
         
-
+        # obtain the original bounds for dense point sampling on the hand 
+        xyz_l_hand_min_xyz = np.min(xyz_l_hand, axis=0)
+        xyz_l_hand_max_xyz = np.max(xyz_l_hand, axis=0)
+        xyz_l_hand_min_xyz -= 0.05
+        xyz_l_hand_max_xyz += 0.05
+        
+        # obtain the original bounds for dense point sampling on the hand 
+        xyz_r_hand_min_xyz = np.min(xyz_r_hand, axis=0)
+        xyz_r_hand_max_xyz = np.max(xyz_r_hand, axis=0)
+        xyz_r_hand_min_xyz -= 0.05
+        xyz_r_hand_max_xyz += 0.05
+        
         # xyz2 = np.append(xyz_face,xyz,axis=0)
         # xyz2 = np.append(xyz_hand,xyz2,axis=0)
 
         # Define the number of points along each axis (resolution of the grid)
-        num_points = 55  # For example, 10 points along each axis
+        num_points_face = 25  # Face
+        num_points_hand = 5  # hands
         
-        # Create a grid of points within the bounding box
-        x = np.linspace(xyz_face_min_xyz[0], xyz_face_max_xyz[0], num_points)
-        y = np.linspace(xyz_face_min_xyz[1], xyz_face_max_xyz[1], num_points)
-        z = np.linspace(xyz_face_min_xyz[2], xyz_face_max_xyz[2], num_points)
+        # Create a grid of points within the bounding box for face
+        x = np.linspace(xyz_face_min_xyz[0], xyz_face_max_xyz[0], num_points_face)
+        y = np.linspace(xyz_face_min_xyz[1], xyz_face_max_xyz[1], num_points_face)
+        z = np.linspace(xyz_face_min_xyz[2], xyz_face_max_xyz[2], num_points_face)
 
         # Generate all combinations of x, y, z
         X, Y, Z = np.meshgrid(x, y, z)
         # Reshape the grid to get a flat list of 3D points
         xyz_face_world_bound = np.vstack([X.ravel(), Y.ravel(), Z.ravel()]).T
+
+        # Create a grid of points within the bounding box for l_hand
+        x = np.linspace(xyz_l_hand_min_xyz[0], xyz_l_hand_max_xyz[0], num_points_hand)
+        y = np.linspace(xyz_l_hand_min_xyz[1], xyz_l_hand_max_xyz[1], num_points_hand)
+        z = np.linspace(xyz_l_hand_min_xyz[2], xyz_l_hand_max_xyz[2], num_points_hand)
+
+        # Generate all combinations of x, y, z
+        X, Y, Z = np.meshgrid(x, y, z)
+        # Reshape the grid to get a flat list of 3D points
+        xyz_l_hand_world_bound = np.vstack([X.ravel(), Y.ravel(), Z.ravel()]).T
+
+        # Create a grid of points within the bounding box for r_hand
+        x = np.linspace(xyz_r_hand_min_xyz[0], xyz_r_hand_max_xyz[0], num_points_hand)
+        y = np.linspace(xyz_r_hand_min_xyz[1], xyz_r_hand_max_xyz[1], num_points_hand)
+        z = np.linspace(xyz_r_hand_min_xyz[2], xyz_r_hand_max_xyz[2], num_points_hand)  
+
+        # Generate all combinations of x, y, z
+        X, Y, Z = np.meshgrid(x, y, z)
+        # Reshape the grid to get a flat list of 3D points
+        xyz_r_hand_world_bound = np.vstack([X.ravel(), Y.ravel(), Z.ravel()]).T      
+
+
         xyz2 = np.append(xyz_face_world_bound,xyz,axis=0)
+        xyz2 = np.append(xyz_l_hand_world_bound,xyz2,axis=0)
+        xyz2 = np.append(xyz_r_hand_world_bound,xyz2,axis=0)
         ###############################**********************########################################## change 2 
     
         # xyz2 = np.append(xyz_face_world_bound,xyz2,axis=0)
@@ -793,7 +830,7 @@ def readZJUMoCapRefineInfo(path, white_background, output_path, eval):
         # for x in range(9):
         #     xyz2 = np.append(xyz_hand,xyz2,axis=0)
             
-        print("Summary of points in cloud",xyz.shape ,xyz2.shape,xyz_face_world_bound.shape)
+        print("Summary of points in cloud",xyz.shape ,xyz2.shape,xyz_face_world_bound.shape,xyz_l_hand_world_bound.shape,xyz_r_hand_world_bound.shape)
         # num_pts2 = xyz2.shape[0]
         # num_pts = num_pts2
         # xyz = xyz2
@@ -814,7 +851,8 @@ def readZJUMoCapRefineInfo(path, white_background, output_path, eval):
         # Print the length of the filtered list to verify
         print("Ideal shape should 6890",xyz3.shape[0])  # Should be 6890 
         num_pts3=xyz3.shape[0]
-        # 11895 #5005
+        
+        # reassign to original names
         num_pts = num_pts3 
         xyz = xyz3
         print(f"Generating random point cloud ({num_pts})...")

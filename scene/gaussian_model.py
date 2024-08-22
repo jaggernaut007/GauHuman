@@ -25,7 +25,7 @@ import pickle
 import torch.nn.functional as F
 from nets.mlp_delta_body_pose import BodyPoseRefiner
 from nets.mlp_delta_weight_lbs import LBSOffsetDecoder
-
+from layers import SinkhornDistance
 class GaussianModel:
 
     def setup_functions(self):

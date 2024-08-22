@@ -736,6 +736,8 @@ def readZJUMoCapRefineInfo(path, white_background, output_path, eval):
                 'leye': 2800,
                 'rear':	4071,
                 'lear':	583,
+                'head':435,
+                'chin':5023,
         }
         hand = {
                 'rthumb':		6191,

@@ -25,7 +25,7 @@ import pickle
 import torch.nn.functional as F
 from nets.mlp_delta_body_pose import BodyPoseRefiner
 from nets.mlp_delta_weight_lbs import LBSOffsetDecoder
-
+from geomloss import SamplesLoss
 class GaussianModel:
 
     def setup_functions(self):
@@ -437,7 +437,7 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
-    def kl_densify_and_clone(self, grads, grad_threshold, scene_extent, kl_threshold=0.4):
+    def kl_densify_and_clone(self, grads, grad_threshold, scene_extent, kl_threshold=0.5):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
@@ -458,7 +458,7 @@ class GaussianModel:
         scaling_diag_1 = scaling_diag[:, 1:].reshape(-1, 3)
 
         kl_div = self.kl_div(xyz_0, rotation_0_q, scaling_diag_0, xyz_1, rotation_1_q, scaling_diag_1)
-        self.kl_selected_pts_mask = kl_div > kl_threshold
+        self.kl_selected_pts_mask = kl_div > 0.6 #kl_threshold
 
         selected_pts_mask = selected_pts_mask & self.kl_selected_pts_mask
 
@@ -476,7 +476,147 @@ class GaussianModel:
         new_opacity = self._opacity[selected_pts_mask]
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+##############################################edit###########################################################
+    def sk_densify_and_clone(self, grads, grad_threshold, scene_extent, kl_threshold=0.4):
+        # Extract points that satisfy the gradient condition
+        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+        selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                              torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
 
+        # for each gaussian point, find its nearest 2 points and return the distance
+        _, point_ids = self.knn_near_2(self._xyz[None].detach(), self._xyz[None].detach())  
+        # Extract the corresponding features for the nearest neighbors
+        xyz = self._xyz[point_ids[0]].detach()
+        rotation_q = self._rotation[point_ids[0]].detach()
+        scaling_diag = self.get_scaling[point_ids[0]].detach()
+        
+        # Define xyz_0, rotation_0_q, scaling_diag_0 as the first nearest neighbor
+        xyz_0 = xyz[:, 0].reshape(-1, 3).contiguous()
+        rotation_0_q = rotation_q[:, 0].reshape(-1, 4)
+        scaling_diag_0 = scaling_diag[:, 0].reshape(-1, 3)
+        
+        # Define xyz_1, rotation_1_q, scaling_diag_1 as the remaining nearest neighbors (if applicable)
+        xyz_1 = xyz[:, 1:].reshape(-1, 3).contiguous()
+        rotation_1_q = rotation_q[:, 1:].reshape(-1, 4)
+        scaling_diag_1 = scaling_diag[:, 1:].reshape(-1, 3)
+
+        # Compute the enhanced cost matrix for the nearest neighbors
+        cost_matrix = self.enhanced_cost(xyz_0, xyz_1, rotation_0_q, rotation_1_q, scaling_diag_0, scaling_diag_1)
+        
+        # Compute the Sinkhorn distance using the enhanced cost matrix
+        loss = SamplesLoss("sinkhorn", blur=0.1)
+        sinkhorn_distance = loss(xyz_0, xyz_1)
+        # self.sk_selected_pts_mask = sinkhorn_distance < kl_threshold
+        print(f"Sinkhorn Distance with rotation, scaling, and KNN (using knn_cuda): {sinkhorn_distance.item()}")
+        
+        
+        # kl_div = self.kl_div(xyz_0, rotation_0_q, scaling_diag_0, xyz_1, rotation_1_q, scaling_diag_1)
+        # self.kl_selected_pts_mask = kl_div > kl_threshold
+
+        self.sk_selected_pts_mask = sinkhorn_distance > 0.75e-06
+        selected_pts_mask_sk = selected_pts_mask  & self.sk_selected_pts_mask
+        print("[sk clone]: ", (selected_pts_mask_sk  & self.sk_selected_pts_mask).sum().item())
+
+        # selected_pts_mask = selected_pts_mask & self.kl_selected_pts_mask
+
+        # print("[kl clone]: ", (selected_pts_mask & self.kl_selected_pts_mask).sum().item())
+
+        stds = self.get_scaling[selected_pts_mask_sk]
+        means =torch.zeros((stds.size(0), 3),device="cuda")
+        samples = torch.normal(mean=means, std=stds)
+        rots = build_rotation(self._rotation[selected_pts_mask_sk])
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask_sk]
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask_sk])
+        new_rotation = self._rotation[selected_pts_mask_sk]
+        new_features_dc = self._features_dc[selected_pts_mask_sk]
+        new_features_rest = self._features_rest[selected_pts_mask_sk]
+        new_opacity = self._opacity[selected_pts_mask_sk]
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+
+    def quaternion_distance(self,q1, q2):
+        # Calculate the distance between two quaternions
+        return torch.acos(2 * torch.sum(q1 * q2, dim=-1).abs() - 1)
+    
+    def enhanced_cost(self,xyz_0, xyz_1, rotation_0_q, rotation_1_q, scaling_diag_0, scaling_diag_1):
+        # Positional cost (Euclidean distance)
+        positional_cost = torch.cdist(xyz_0, xyz_1, p=2)
+        
+        # Rotational cost (geodesic distance in quaternion space)
+        rotational_cost = self.quaternion_distance(rotation_0_q[:, None, :], rotation_1_q[None, :, :])
+        
+        # Scaling cost (L2 norm of the difference between scaling diagonals)
+        scaling_cost = torch.cdist(scaling_diag_0, scaling_diag_1, p=2)
+        
+        # Combine the costs with weights (you may adjust these weights)
+        combined_cost = positional_cost + rotational_cost + scaling_cost
+        
+        return combined_cost
+###########################################edit##############################################################
+    
+    def sk_densify_and_split(self, grads, grad_threshold, scene_extent, kl_threshold=0.4, N=2):
+        n_init_points = self.get_xyz.shape[0]
+        # Extract points that satisfy the gradient condition
+        padded_grad = torch.zeros((n_init_points), device="cuda")
+        padded_grad[:grads.shape[0]] = grads.squeeze()
+        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
+        selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+
+        # for each gaussian point, find its nearest 2 points and return the distance
+        _, point_ids = self.knn_near_2(self._xyz[None].detach(), self._xyz[None].detach())     
+        xyz = self._xyz[point_ids[0]].detach()
+        rotation_q = self._rotation[point_ids[0]].detach()
+        scaling_diag = self.get_scaling[point_ids[0]].detach()
+
+        xyz_0 = xyz[:, 0].reshape(-1, 3).contiguous()
+        rotation_0_q = rotation_q[:, 0].reshape(-1, 4)
+        scaling_diag_0 = scaling_diag[:, 0].reshape(-1, 3)
+
+        xyz_1 = xyz[:, 1:].reshape(-1, 3).contiguous()
+        rotation_1_q = rotation_q[:, 1:].reshape(-1, 4)
+        scaling_diag_1 = scaling_diag[:, 1:].reshape(-1, 3)
+
+        # Compute the enhanced cost matrix for the nearest neighbors
+        cost_matrix = self.enhanced_cost(xyz_0, xyz_1, rotation_0_q, rotation_1_q, scaling_diag_0, scaling_diag_1)
+        
+        # Compute the Sinkhorn distance using the enhanced cost matrix
+        loss = SamplesLoss("sinkhorn", blur=0.1)
+        sinkhorn_distance = loss(xyz_0, xyz_1)
+        # self.sk_selected_pts_mask = sinkhorn_distance < kl_threshold
+        print(f"Sinkhorn Distance with rotation, scaling, and KNN (using knn_cuda): {sinkhorn_distance.item()}")
+        
+        
+        # kl_div = self.kl_div(xyz_0, rotation_0_q, scaling_diag_0, xyz_1, rotation_1_q, scaling_diag_1)
+        # self.kl_selected_pts_mask = kl_div > kl_threshold
+
+        self.sk_selected_pts_mask = sinkhorn_distance > 0.75e-06
+        selected_pts_mask_sk = selected_pts_mask  & self.sk_selected_pts_mask
+        print("[sk split]: ", (selected_pts_mask_sk  & self.sk_selected_pts_mask).sum().item())
+        
+        # kl_div = self.kl_div(xyz_0, rotation_0_q, scaling_diag_0, xyz_1, rotation_1_q, scaling_diag_1)
+        # self.kl_selected_pts_mask = kl_div > kl_threshold
+
+        # selected_pts_mask = selected_pts_mask & self.kl_selected_pts_mask
+
+        # print("[kl split]: ", (selected_pts_mask & self.kl_selected_pts_mask).sum().item())
+
+        stds = self.get_scaling[selected_pts_mask_sk].repeat(N,1)
+        means =torch.zeros((stds.size(0), 3),device="cuda")
+        samples = torch.normal(mean=means, std=stds)
+        rots = build_rotation(self._rotation[selected_pts_mask_sk]).repeat(N,1,1)
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask_sk].repeat(N, 1)
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask_sk].repeat(N,1) / (0.8*N))
+        new_rotation = self._rotation[selected_pts_mask_sk].repeat(N,1)
+        new_features_dc = self._features_dc[selected_pts_mask_sk].repeat(N,1,1)
+        new_features_rest = self._features_rest[selected_pts_mask_sk].repeat(N,1,1)
+        new_opacity = self._opacity[selected_pts_mask_sk].repeat(N,1)
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+
+        prune_filter = torch.cat((selected_pts_mask_sk, torch.zeros(N * selected_pts_mask_sk.sum(), device="cuda", dtype=bool)))
+        self.prune_points(prune_filter)
+    
     def kl_densify_and_split(self, grads, grad_threshold, scene_extent, kl_threshold=0.4, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
@@ -501,7 +641,7 @@ class GaussianModel:
         scaling_diag_1 = scaling_diag[:, 1:].reshape(-1, 3)
 
         kl_div = self.kl_div(xyz_0, rotation_0_q, scaling_diag_0, xyz_1, rotation_1_q, scaling_diag_1)
-        self.kl_selected_pts_mask = kl_div > kl_threshold
+        self.kl_selected_pts_mask = kl_div > 0.6 #kl_threshold
 
         selected_pts_mask = selected_pts_mask & self.kl_selected_pts_mask
 
@@ -547,7 +687,7 @@ class GaussianModel:
         scaling_diag_1 = scaling_diag[:, 1:].reshape(-1, 3)
 
         kl_div = self.kl_div(xyz_0, rotation_0_q, scaling_diag_0, xyz_1, rotation_1_q, scaling_diag_1)
-        self.kl_selected_pts_mask = kl_div < kl_threshold
+        self.kl_selected_pts_mask = kl_div < 0.2 #kl_threshold
 
         selected_pts_mask = selected_pts_mask & self.kl_selected_pts_mask
 
@@ -570,15 +710,84 @@ class GaussianModel:
             prune_filter = torch.cat((selected_pts_mask, torch.zeros(new_xyz.shape[0], device="cuda", dtype=bool)))
             self.prune_points(prune_filter)
 
+
+    def sk_merge(self, grads, grad_threshold, scene_extent, kl_threshold=0.1):
+        n_init_points = self.get_xyz.shape[0]
+        # Extract points that satisfy the gradient condition
+        padded_grad = torch.zeros((n_init_points), device="cuda")
+        padded_grad[:grads.shape[0]] = grads.squeeze()
+        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
+        selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                              torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+
+        # for each gaussian point, find its nearest 2 points and return the distance
+        _, point_ids = self.knn_near_2(self._xyz[None].detach(), self._xyz[None].detach())     
+        xyz = self._xyz[point_ids[0]].detach()
+        rotation_q = self._rotation[point_ids[0]].detach()
+        scaling_diag = self.get_scaling[point_ids[0]].detach()
+
+        xyz_0 = xyz[:, 0].reshape(-1, 3).contiguous()
+        rotation_0_q = rotation_q[:, 0].reshape(-1, 4)
+        scaling_diag_0 = scaling_diag[:, 0].reshape(-1, 3)
+
+        xyz_1 = xyz[:, 1:].reshape(-1, 3).contiguous()
+        rotation_1_q = rotation_q[:, 1:].reshape(-1, 4)
+        scaling_diag_1 = scaling_diag[:, 1:].reshape(-1, 3)
+
+        # Compute the enhanced cost matrix for the nearest neighbors
+        cost_matrix = self.enhanced_cost(xyz_0, xyz_1, rotation_0_q, rotation_1_q, scaling_diag_0, scaling_diag_1)
+        
+        # Compute the Sinkhorn distance using the enhanced cost matrix
+        loss = SamplesLoss("sinkhorn", blur=0.1)
+        sinkhorn_distance = loss(xyz_0, xyz_1)
+        # self.sk_selected_pts_mask = sinkhorn_distance < kl_threshold
+        print(f"Sinkhorn Distance with rotation, scaling, and KNN (using knn_cuda): {sinkhorn_distance.item()}")
+        
+
+        self.sk_selected_pts_mask = sinkhorn_distance < 0.5e-06
+        selected_pts_mask_sk = selected_pts_mask  & self.sk_selected_pts_mask
+        print("[sk merge]: ", (selected_pts_mask_sk  & self.sk_selected_pts_mask).sum().item())
+        
+        # kl_div = self.kl_div(xyz_0, rotation_0_q, scaling_diag_0, xyz_1, rotation_1_q, scaling_diag_1)
+        # self.kl_selected_pts_mask = kl_div < kl_threshold
+
+        # selected_pts_mask = selected_pts_mask & self.kl_selected_pts_mask
+
+        # print("[kl merge]: ", (selected_pts_mask & self.kl_selected_pts_mask).sum().item())
+
+        if selected_pts_mask_sk.sum() >= 1:
+
+            selected_point_ids = point_ids[0][selected_pts_mask_sk]
+            new_xyz = self.get_xyz[selected_point_ids].mean(1)
+            new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_point_ids][:,0] / 0.8)
+            new_rotation = self._rotation[selected_point_ids][:,0]
+            new_features_dc = self._features_dc[selected_point_ids].mean(1)
+            new_features_rest = self._features_rest[selected_point_ids].mean(1)
+            new_opacity = self._opacity[selected_point_ids].mean(1)
+
+            self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+
+            selected_pts_mask_sk[selected_point_ids[:,1]] = True
+            # prune_filter = torch.cat((selected_pts_mask, torch.zeros(selected_pts_mask.sum(), device="cuda", dtype=bool)))
+            prune_filter = torch.cat((selected_pts_mask_sk, torch.zeros(new_xyz.shape[0], device="cuda", dtype=bool)))
+            self.prune_points(prune_filter)
+
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, kl_threshold=0.4, t_vertices=None, iter=None):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         # self.densify_and_clone(grads, max_grad, extent)
         # self.densify_and_split(grads, max_grad, extent)
+        
+        # self.sk_densify_and_clone(grads, max_grad, extent, kl_threshold)
+        # self.sk_densify_and_split(grads, max_grad, extent, kl_threshold)
+        # self.sk_merge(grads, max_grad, extent, 0.1)
+
         self.kl_densify_and_clone(grads, max_grad, extent, kl_threshold)
         self.kl_densify_and_split(grads, max_grad, extent, kl_threshold)
         self.kl_merge(grads, max_grad, extent, 0.1)
+
+        
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
